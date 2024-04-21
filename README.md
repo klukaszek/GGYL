@@ -8,7 +8,9 @@ To solve this problem I decided to create Gargoyle, my simple directory watching
 
 ## Compilation
 
-On all platforms, run the following command in the terminal to compile Gargoyle.
+On Linux and MacOS, run the following command in the terminal to compile Gargoyle.
+
+Gargoyle is not implemented for Windows, but I'll look into it.
 
 ```
 Make
