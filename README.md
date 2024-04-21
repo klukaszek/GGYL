@@ -6,6 +6,14 @@ I came across the problem of wanting a C build system that I could use to hot-re
 
 To solve this problem I decided to create Gargoyle, my simple directory watching and CLI automation solution.
 
+### Key Features
+
+- Real-time Monitoring: Watches for any changes in the directory like new files, modifications, or deletions.
+- Automatic Command Execution: Executes a specified command or script immediately after detecting a change.
+- Customizable: Allows users to specify the directory to monitor and the command to execute.
+- Resource Efficient: Designed to use minimal system resources, leveraging native operating system event monitoring interfaces.
+- Versatile Use Cases: Useful for backup systems, auto-syncing files, auto-compilation in development environments, or any automated tasks triggered by file system changes.
+
 ## Compilation
 
 On Linux and MacOS, run the following command in the terminal to compile Gargoyle.
