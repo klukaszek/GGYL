@@ -206,18 +206,12 @@ int add_watch_rec(monitor_t mon, char *root) {
 
   struct dirent *entry;
 
-  int flag = 0;
-
   // Iterate over directory contents
   while ((entry = readdir(dir)) != NULL) {
 
     // If the current entry is a directory, we want to recursively call this
     // function to add another watch to the file descriptor
     if (entry->d_type == DT_DIR) {
-
-      // Indicate that we successfully found a directory
-      flag = 1;
-
       char path[MAX_LEN];
       // Skip "current" and "parent" directories
       if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
