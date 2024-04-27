@@ -310,58 +310,6 @@ void _find_and_remove_node(node_t **parent, node_t **current, node_t *target) {
     }
 }
 
-// Helper function to print a list of node_t nodes
-void _print_list_helper(node_t *node) {
-    if (node == NULL) {
-        return;
-    }
-
-    // Print the node data if a print function is provided
-    if (node->print != NULL) {
-        node->print(node->data);
-        if (node->num_children > 0)
-            printf(" -> ");
-    } else {
-        printf("(Warning: No print function)");
-    }
-
-    // Print the children of the node recursively
-    for (int i = 0; i < node->num_children; i++) {
-        _print_list_helper(node->next[i]);
-    }
-}
-
-// Helper function to print out the indentation for the tree print function
-void _indent(int depth) {
-    for (int i = 0; i < depth; i++) {
-        printf("  ");
-    }
-}
-
-// Helper function to print a tree of node_t nodes
-void _print_tree_helper(node_t *node, int depth) {
-    if (node == NULL) {
-        return;
-    }
-
-    _indent(depth);
-
-    if (node->print != NULL) {
-        node->print(node->data);
-        printf("\n");
-    } else {
-        printf("Warning: No print function provided for tree node\n");
-    }
-
-    _indent(depth);
-
-    printf("-> %d children\n", node->num_children);
-
-    for (int i = 0; i < node->num_children; i++) {
-        _print_tree_helper(node->next[i], depth + 1);
-    }
-}
-
 // Print the information of an individual node_t node
 // Uses the node_t->print function if it exists, otherwise print warnings
 //
