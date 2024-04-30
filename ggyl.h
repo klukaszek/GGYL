@@ -1,566 +1,812 @@
+#include <dirent.h>
+#include <errno.h>
+#include <getopt.h>
+#include <regex.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/inotify.h>
+#include <sys/select.h>
+#include <unistd.h>
 
 /*
  *  Author:     Kyle Lukaszek
  *  Date:       04/25/2024
  *  Email:      klukasze@uoguelph.ca
- *
- *  Description:
- *
- *  This file contains a set of macros and functions to create and manage node
- *  based data structures. At the core of this file is the node_t structure
- *  which is a generic structure that can be used to store any type of data. At
- *  the moment, node structures can be used to create linked lists or trees with
- *  any number of children per node.
- *
- *  The idea behind this file is to let me copy and paste my code into any
- *  project and have a working data structure that can be used to store any type
- *  of data.
- *
- *  A node structure is defined as follows:
- *
- *  typedef struct node_t {
- *      T *data;              // Pointer to the data to store in the node
- *      struct node_t **next;   // Pointer to the children of the node
- *      node_config type;       // Configuration enum (LIST or TREE)
- *      int num_children;
- *      void (*free)(T *);                // Function pointer to free the node
- *      void (*print)(T *);               // Function pointer to print the node
- *      int (*compare)(T *, T *);         // Function pointer to compare nodes
- *  } node_t;
- *
- *  Future Work:
- *
- *  - Implement stack and queue data structures
- *      - Stack can extend the list node structure
- *      - Queue should be properly implemented such that all data is contiguous
- *      - Queue size should be static
- *      - Queue should have pointers to the front and back of the queue
- *
  */
 
-/* ---------------------------- Node Structure --------------------------- */
-
-/* I am creating a tree that can have any number of children per node. To
- * accomplish this, I am storing the children in a linked list so they can
- * easily be removed from memory once they are no longer necessary. */
-
-// Enumeration for the node types
-typedef enum { LIST, TREE } node_config;
+/* -------- My Personal Data Structure Definitions --------- */
 
 // Function pointer types for the node_t node
 typedef void (*free_func)(void *);
 typedef void (*print_func)(void *);
 typedef int (*compare_func)(void *, void *);
+typedef const char *(*to_string_func)(void *);
 
-// Abstract structure for the node_t node.
-// It might be better to declare the function pointers in the list_t and tree_t
-// to save 24 bytes per node, but I like having them here :)
-#define DEFINE_NODE_STRUCT(T)                                                  \
-    typedef struct node_t {                                                    \
-        T *data;                                                               \
-        struct node_t **next;                                                  \
-        node_config type;                                                      \
-        int num_children;                                                      \
-        void (*free)(T *);                                                     \
-        void (*print)(T *);                                                    \
-        int (*compare)(T *, T *);                                              \
-    } node_t;
+// Doubly linked list node
+typedef struct elem_t {
+    void *data;
+    struct elem_t *next;
+    struct elem_t *prev;
+} elem_t;
 
-// Define the node_t structure for int data
-DEFINE_NODE_STRUCT(int);
-// DEFINE_NODE_STRUCT(float_node, float);
-
-// List structure to store a list of node_t nodes
+// Doubly linked list
 typedef struct list_t {
-    node_t *head;
-    node_t *tail;
+    elem_t *head;
+    elem_t *tail;
     int size;
+    free_func free;
+    compare_func compare;
+    to_string_func to_str;
+    print_func print;
 } list_t;
 
-// Tree structure to store a tree of node_t nodes
+// Macro to define a list structure for a given type
+// You can technically just use the list struct, but this is more explicit and I
+// find it easier to read when using the functions
+#define DEFINE_LIST_STRUCT(T) typedef struct list_t T##_list;
+
+// Define the list structs for int and float types
+DEFINE_LIST_STRUCT(int)
+DEFINE_LIST_STRUCT(float)
+
+// Tree node with n children
+typedef struct node_t {
+    void *data;
+    struct node_t *parent;
+    struct node_t **children;
+    int num_children;
+} node_t;
+
+// Tree with n children
 typedef struct tree_t {
     node_t *root;
-    int size;
+    int num_children;
+    free_func free;
+    compare_func compare;
+    to_string_func to_str;
+    print_func print;
 } tree_t;
 
-/* ---------------------------- Node Functions ------------------------------ */
+// Macro to define a tree structure for a given type
+#define DEFINE_TREE_STRUCT(T) typedef struct tree_t T##_tree;
 
-// Generic function to initialize a node_t node with a given data and type.
-// You should not use this function directly, use CREATE_NODE instead unless you
-// know what you are doing
-#define init_node(node, _data, node_config, _free, _print, _compare)           \
-    do {                                                                       \
-        node->data = _data;                                                    \
-        node->type = node_config;                                              \
-        node->next = NULL;                                                     \
-        node->num_children = 0;                                                \
-        node->free = _free;                                                    \
-        node->print = _print;                                                  \
-        node->compare = _compare;                                              \
-    } while (0)
+DEFINE_TREE_STRUCT(int)
+DEFINE_TREE_STRUCT(float)
 
-/**
- * Creates a node of type `T`, initializes it with `data`, `node_config`, and
- * function pointers for `free`, `print`, and `compare`.
- * @param T The data type of the node's data.
- * @param data Pointer to the data to store in the node.
- * @param node_config Configuration enum (LIST or TREE).
- * @param free Function pointer to free the node data.
- * @param print Function pointer to print the node data.
- * @param compare Function pointer to compare two node data elements.
- * @return Pointer to the newly created node or NULL if memory allocation fails.
+/* -------------------- GGYL Definitions ------------------------- */
+
+#define MAX_LEN 1024
+#define MAX_REGEX 128
+#define MAX_WATCHES 1024
+
+typedef struct {
+    regex_t *regex;
+    int compiled;
+} regex_entry;
+
+typedef struct {
+    int fd;
+    char dir[MAX_LEN];
+    char cmd[MAX_LEN];
+    regex_entry **regex_entries;
+    int num_patterns;
+    int_tree *wd_entries;
+    uint32_t mask;
+} monitor_t;
+
+/* -------------------------- Doubly-LList Macros ------------------------- */
+
+/*
+ * Initialize a list elements
+ * Data is a void pointer to the data
+ * Next and prev are NULL and to be set when adding to the list
  */
-#define create_node(T, data, node_config, free, print, compare)                \
+#define init_elem(elem, _data)                                                 \
     ({                                                                         \
-        node_t *node = (node_t *)malloc(sizeof(node_t));                       \
-        typeof(data)(_data) = (data); /* Handle expressions */                 \
-        void (*_free)(T *) = (free);                                           \
-        void (*_print)(T *) = (print);                                         \
-        int (*_compare)(T *, T *) = (compare);                                 \
-        if (node == NULL) {                                                    \
-            printf("Error: Could not allocate memory for node\n");             \
-            node = NULL;                                                       \
-        } else {                                                               \
-            init_node(node, _data, node_config, _free, _print, _compare);      \
-        }                                                                      \
-        node;                                                                  \
+        elem->data = _data;                                                    \
+        elem->next = NULL;                                                     \
+        elem->prev = NULL;                                                     \
+        elem;                                                                  \
     })
 
-// Generic function to create a list node (1 child) with a given data and
-// children
-#define create_list_node(T, data, free, print, compare)                        \
-    create_node(T, data, LIST, free, print, compare)
-
-// Generic function to create a tree node (n children) with a given data and
-// children
-//
-// Calls: CREATE_NODE
-#define create_tree_node(T, data, free, print, compare)                        \
-    create_node(T, data, TREE, free, print, compare)
-
-// Helper function to add a child to a node_t node
-void _add_child(node_t *parent, node_t *child) {
-
-    if (parent == NULL || child == NULL) {
-        printf("Error: Parent or child node is NULL\n");
-        return;
-    }
-
-    node_config parent_type = parent->type;
-
-    switch (parent_type) {
-        // If the parent is a list node, add the child to the next pointer
-        // If the next pointer is not NULL, keep traversing until the next
-        // available NULL pointer
-        case LIST:
-            {
-                if (parent->num_children != 0 || parent->next != NULL) {
-                    parent = parent->next[0];
-                    _add_child(parent, child);
-                    return;
-                }
-
-                // Allocate memory for the child node but only allocate memory
-                // for 1 child Since the node is type LIST, any functions should
-                // know that it can only have 1 child
-                parent->next = (node_t **)malloc(sizeof(node_t *));
-                parent->next[0] = child;
-                parent->num_children++;
-                return;
-            }
-
-        // If the parent is a tree node, add the child to the list of children
-        case TREE:
-            {
-                // Reallocation of the children array to add the new child
-                parent->next = (node_t **)realloc(parent->next,
-                                                  (parent->num_children + 1) *
-                                                      sizeof(node_t *));
-                if (parent->next == NULL) {
-                    printf("Error: Could not allocate memory for new child\n");
-                    return;
-                }
-
-                // Add the child to the parent's children array and increment
-                parent->next[parent->num_children] = child;
-                parent->num_children++;
-                return;
-            }
-    }
-}
-
-// Generic function to add a child to a node_t node, this will catch if the node
-// is a list node or a tree node
-//
-// Calls: _add_child
-#define add_child(parent, child) _add_child(parent, child);
-
-// Free a node_t node with a given data type
-// Checks if the node is NULL, if the data is NULL, and if the free function is
-// null If the data is not NULL, it will free the data using the free function
-// if it exists Otherwise, it will use free() It will then free all of the
-// children of the node recursively If you do not want to free the node's
-// children from your structure, use REMOVE_NODE instead
-void _free_node(node_t *node) {
-    if (node == NULL) {
-        return;
-    }
-
-    if (node->data != NULL) {
-        if (node->free != NULL) {
-            node->free(node->data);
-        } else {
-            printf("Warning: No free function provided for node\n");
-            free(node->data);
-        }
-    }
-
-    for (int i = 0; i < node->num_children; i++) {
-        _free_node(node->next[i]);
-    }
-
-    free(node->next);
-    free(node);
-}
-
-// Free a node_t node with a given data type
-// Checks if the node is NULL, if the data is NULL, and if the free function is
-// null If the data is not NULL, it will free the data using the free function
-// if it exists Otherwise, it will use free() It will then free all of the
-// children of the node recursively If you do not want to free the node's
-// children from your structure, use REMOVE_NODE instead
-//
-// Calls: _free_node
-#define free_node(node) _free_node(node);
-
-// Remove a node_t node from the tree and free data if it exists.
-// This function will search for the parent of the node and remove the node from
-// the parent's children. The children of the target node will be orphaned to
-// parent node and will not be freed. If you want to free the children of the
-// node use free_node instead.
-//
-// Calls: _find_and_remove_node -> _remove_node
-#define remove_node(root, target)                                              \
-    ({                                                                         \
-        typeof(root) _root = (root);                                           \
-        typeof(target) _target = (target);                                     \
-        node_t *parent = NULL;                                                 \
-        node_t *current = _root;                                               \
-        _find_and_remove_node(&parent, &current, _target);                     \
-    })
-
-// Helper function to remove a node at a specific index from the parent node
-void _remove_node_at(node_t *parent, int index) {
-    if (parent == NULL) {
-        printf("Error: Parent node is NULL\n");
-        return;
-    }
-
-    if (index < 0 || index >= parent->num_children) {
-        printf("Error: Index out of bounds\n");
-        return;
-    }
-
-    // Get the node to remove
-    node_t *to_remove = parent->next[index];
-
-    // Reattach the children of the node to the parent
-    for (int i = index; i < parent->num_children; i++) {
-        parent->next[parent->num_children++] = to_remove->next[i];
-    }
-
-    // Remove the reference to the node from the parent's children array
-    parent->num_children--;
-    for (int i = index; i < parent->num_children; i++) {
-        parent->next[i] = parent->next[i + 1];
-    }
-
-    _free_node(to_remove);
-}
-
-// Function to remove a target node from the parent node's children array
-#define remove_node_at(parent, index)                                          \
-    ({                                                                         \
-        typeof(parent) _parent = (parent);                                     \
-        typeof(index) _index = (index);                                        \
-        _remove_node_at(_parent, _index);                                      \
-    })
-
-// Helper function to find a node in the tree and remove it
-void _find_and_remove_node(node_t **parent, node_t **current, node_t *target) {
-    if (*current == NULL)
-        return;
-
-    // Iterate through the children of the current node to find the target node
-    for (int i = 0; i < (*current)->num_children; i++) {
-        if ((*current)->next[i] == target) {
-            // Remove the target node from the current node's children
-            for (int j = i; j < (*current)->num_children - 1; j++) {
-                (*current)->next[j] = (*current)->next[j + 1];
-            }
-            _free_node(target);
-            (*current)->num_children--;
-            return;
-        }
-
-        // Recursively search for the target node in the current node's children
-        _find_and_remove_node(&(*current), &(*current)->next[i], target);
-    }
-}
-
-// Print the information of an individual node_t node
-// Uses the node_t->print function if it exists, otherwise print warnings
-//
-// Output:
-// Node:
-// -> Data: 1
-// -> Type: List or Tree
-#define print_node(node)                                                       \
-    ({                                                                         \
-        if (node == NULL) {                                                    \
-            printf("Error: Node is NULL\n");                                   \
-        } else {                                                               \
-            if (node->print != NULL) {                                         \
-                printf("Node:\n-> Data: ");                                    \
-                node->print(node->data);                                       \
-                printf("\n-> Type: %s\n",                                      \
-                       node->type == LIST ? "List" : "Tree");                  \
-                printf("-> Children: %d\n", node->num_children);               \
-            } else {                                                           \
-                printf("Warning: No print function provided for node\n");      \
-                printf("Node:\n-> Type: %s\n",                                 \
-                       node->type == LIST ? "List" : "Tree");                  \
-            }                                                                  \
-        }                                                                      \
-    })
-
-// Print out a node_t node and all of its children recursively
-//
-// Calls: _print_list_helper || _print_tree_helper
-//
-// Output:
-//
-// List: 1 -> 2 -> 3 -> 4
-//
-// Tree:
-// 1
-//  -> 2 children
-//      2
-//      -> 1 children
-#define print_node_rec(node)                                                   \
-    ({                                                                         \
-        if (node == NULL) {                                                    \
-            printf("Error: Node is NULL\n");                                   \
-        } else {                                                               \
-            switch (node->type) {                                              \
-                case LIST:                                                     \
-                    {                                                          \
-                        printf("List: ");                                      \
-                        _print_list_helper(node);                              \
-                        printf("\n");                                          \
-                        break;                                                 \
-                    }                                                          \
-                case TREE:                                                     \
-                    {                                                          \
-                        printf("Tree:\n");                                     \
-                        _print_tree_helper(node, 0);                           \
-                        break;                                                 \
-                    }                                                          \
-            }                                                                  \
-        }                                                                      \
-    })
-
-// Helper function to map a evaluate a function using an entire node_t data
-// structure
-//
-// (list_t)[1, 2, 3, 4] -> map([1, 2, 3, 4], print_node) -> "1 2 3 4")
-void map_node(node_t *node, void (*func)(node_t *)) {
-    if (node == NULL) {
-        return;
-    }
-
-    func(node);
-
-    for (int i = 0; i < node->num_children; i++) {
-        map_node(node->next[i], func);
-    }
-}
-
-/* ---------------------------- Watch Descriptors --------------------------
+/*
+ * Initialize a list
+ * Head and tail are NULL
+ * It is important to set the helper functions for the list
+ * The helper functions are used to free, compare, convert to string, and print
+ *
+ * If you have to implement your own helper functions, it is important to make
+ * sure that they are of type free_func, compare_func, to_string_func, and
+ * print_func
+ *
+ * There are pre-defined helper functions for int and float types that can be
+ * used with the list:
+ *
+ * - free_int, compare_int, int_to_str, print_int
+ * - free_float, compare_float, float_to_str, print_float
+ *
+ * You can pass NULL for any of the helper functions, but it is recommended to
+ * assign the helper functions to avoid memory leaks and undefined behaviour.
  */
-// Compare watch descriptor int pointers
-int compare_int(int *a, int *b) { return (*a == *b); }
-
-void print_int(int *wd) { printf("%d", *wd); }
-
-void free_int(int *ptr) { free(ptr); }
-
-int *create_int(int wd) {
-    int *wd_ptr = (int *)malloc(sizeof(int));
-    *wd_ptr = wd;
-    return wd_ptr;
-}
-
-/* ---------------------------- List Functionality -----------------------------
- */
-
-// Function to initialize a list_t structure
-list_t *_init_list() {
-    list_t *list = (list_t *)malloc(sizeof(list_t));
-    list->head = NULL;
-    list->tail = NULL;
-    list->size = 0;
-    return list;
-}
-
-// Generic function to create a linked list of node_t nodes
-#define create_list(T, data, free, print, compare)                             \
+#define list_init(list, _free, _compare, _to_str, _print)                      \
     ({                                                                         \
-        list_t *list = _init_list();                                           \
-        list->head = create_list_node(T, data, free, print, compare);          \
-        list->tail = list->head;                                               \
-        list->size++;                                                          \
+        if (list == NULL) {                                                    \
+            fprintf(                                                           \
+                stderr,                                                        \
+                "Error: list_init(%s, %s, %s, %s, %s) -> \'%s\' is NULL\n",    \
+                #list, #_free, #_compare, #_to_str, #_print, #list);           \
+        }                                                                      \
+        list->head = NULL;                                                     \
+        list->tail = NULL;                                                     \
+        list->size = 0;                                                        \
+        if (_free == NULL || _compare == NULL || _to_str == NULL ||            \
+            _print == NULL) {                                                  \
+            fprintf(stderr,                                                    \
+                    "Warning: list_init(%s, %s, %s, %s, %s) -> NULL helper "   \
+                    "function(s).\n",                                          \
+                    #list, #_free, #_compare, #_to_str, #_print);              \
+        }                                                                      \
+        list->free = (_free);                                                  \
+        list->compare = (_compare);                                            \
+        list->to_str = (_to_str);                                              \
+        list->print = (_print);                                                \
+    })
+
+/*
+ * Create an empty doubly linked list
+ * The list is created with the helper functions for the data type
+ * The helper functions are used to free, compare, convert to string, and print
+ * The helper functions can be NULL, but it is recommended to assign them
+ * SEE: list_init
+ */
+#define create_list(T, free, compare, to_str, print)                           \
+    ({                                                                         \
+        T##_list *list = malloc(sizeof(T##_list));                             \
+        free_func _free = (free);                                              \
+        compare_func _compare = (compare);                                     \
+        to_string_func _to_str = (to_str);                                     \
+        print_func _print = (print);                                           \
+        list_init(list, _free, _compare, _to_str, _print);                     \
         list;                                                                  \
     })
 
-// Function to add a node to the list_t structure
-// If the list is empty, the head and tail will be the same
-// Otherwise, the tail will be updated to the new node_t
-//
-// Calls: add_child
-void _list_t_add(list_t *list, node_t *node) {
-    if (node->type != LIST) {
-        printf("list_add -> Error: Node is not a list node\n");
-        return;
-    }
-    if (list->head == NULL) {
-        list->head = node;
-        list->tail = node;
-    } else {
-        add_child(list->tail, node);
-        list->tail = node;
-    }
-    list->size++;
-}
-
-// Function to remove a node from the list_t structure
-// Calls: remove_node
-void _list_t_remove(list_t *list, node_t *node) {
-    if (node->type != LIST) {
-        printf("list_remove -> Error: Node is not a list node\n");
-        return;
-    }
-    remove_node(list->head, node);
-    list->size--;
-}
-
-// Function to remove a node at a specific index from the list_t structure
-// Calls: remove_node
-void _list_t_remove_at(list_t *list, int index) {
-    if (index < 0 || index >= list->size) {
-        printf("Error: Index out of bounds\n");
-        return;
-    }
-
-    node_t *current = list->head;
-    for (int i = 0; i < index; i++) {
-        current = current->next[0];
-    }
-
-    remove_node(list->head, current);
-    list->size--;
-}
-
-// Function to free a list_t structure, most logic is handled in free_node
-void _list_t_free(list_t *list) {
-    // Free head node and all children
-    free_node(list->head);
-    free(list);
-}
-
-// Function to map a function to each node in the list_t structure
-void _list_t_map(list_t *list, void (*func)(node_t *)) {
-    map_node(list->head, func);
-}
-
-/* ---------------------------- Tree Functions ----------------------------- */
-
-#define create_tree(T, data, free, print, compare)                             \
+/*
+ * Free the list and all of its elements
+ * The list->free function is used to free the data. If the list->free function
+ * is NULL, the data is freed using the free function. This will most likely
+ * result in a memory leak if the data is not a primitive type.
+ */
+#define free_list(list)                                                        \
     ({                                                                         \
-        tree_t *tree = (tree_t *)malloc(sizeof(tree_t));                       \
-        tree->root = create_tree_node(T, data, free, print, compare);          \
-        tree->size = 1;                                                        \
+        if (list == NULL) {                                                    \
+            fprintf(stderr, "Warning: free_list(%s) -> \'%s\' is NULL\n",      \
+                    #list, #list);                                             \
+        } else {                                                               \
+            elem_t *current = list->head;                                      \
+            while (current != NULL) {                                          \
+                elem_t *next = current->next;                                  \
+                if (list->free != NULL)                                        \
+                    list->free(current->data);                                 \
+                else                                                           \
+                    free(current->data);                                       \
+                free(current);                                                 \
+                current = next;                                                \
+            }                                                                  \
+            free(list);                                                        \
+        }                                                                      \
+    })
+
+/*
+ * Print the list
+ * The list->print function is used to print the data for each element
+ * The print_list macro applies the style of the print function
+ */
+#define print_list(list)                                                       \
+    ({                                                                         \
+        if (list == NULL) {                                                    \
+            fprintf(stderr, "Warning: print_list(%s) -> \'%s\' is NULL\n",     \
+                    #list, #list);                                             \
+        } else {                                                               \
+            fprintf(stdout, "List: %s\n -> [", #list);                         \
+            elem_t *current = list->head;                                      \
+            while (current != NULL) {                                          \
+                list->print(current->data);                                    \
+                if (current->next != NULL)                                     \
+                    fprintf(stdout, ", ");                                     \
+                current = current->next;                                       \
+            }                                                                  \
+            fprintf(stdout, "]\n");                                            \
+        }                                                                      \
+    })
+
+/*
+ * Add an element to the list
+ * The data is a void pointer to the data
+ * Returns the data if added, NULL otherwise
+ */
+#define list_add(list, data)                                                   \
+    ({                                                                         \
+        void *_data = NULL;                                                    \
+        if (list == NULL) {                                                    \
+            fprintf(stderr, "Error: list_add(%s, %s) -> \'%s\' is NULL\n",     \
+                    #list, #data, #list);                                      \
+        } else {                                                               \
+            _data = (data);                                                    \
+            elem_t *element = (elem_t *)malloc(sizeof(elem_t));                \
+            element = init_elem(element, _data);                               \
+            if (list->head == NULL) {                                          \
+                list->head = element;                                          \
+            } else {                                                           \
+                list->tail->next = element;                                    \
+            }                                                                  \
+            list->tail = element;                                              \
+            list->size++;                                                      \
+        }                                                                      \
+        _data;                                                                 \
+    })
+
+/*
+ * Get an element at a given index
+ * Returns the element if found, NULL otherwise
+ */
+#define list_at(list, index)                                                   \
+    ({                                                                         \
+        elem_t *current = NULL;                                                \
+        if (list == NULL) {                                                    \
+            fprintf(stderr, "Error: list_at(%s, %d) -> \'%s\' is NULL\n",      \
+                    #list, index, #list);                                      \
+        } else if (index < 0 || index >= list->size) {                         \
+            fprintf(stderr, "Error: list_at(%s, %d) -> Index out of bounds\n", \
+                    #list, index);                                             \
+        } else {                                                               \
+            current = list->head;                                              \
+            for (int i = 0; i < index; i++) {                                  \
+                current = current->next;                                       \
+            }                                                                  \
+        }                                                                      \
+        current;                                                               \
+    })
+
+/*
+ * Find an element in the list based on the data pointer
+ * The compare function is used to determine if the data is equal
+ * Returns the index if found, -1 otherwise
+ *
+ * Example:
+ * int data = 5
+ * list_find(list, &data) -> Returns the index of the element with data 5
+ */
+#define list_find(list, target)                                                \
+    ({                                                                         \
+        int i = -1;                                                            \
+        if (list == NULL) {                                                    \
+            fprintf(stderr, "Error: list_find(%s, %s) -> \'%s\' is NULL\n",    \
+                    #list, #target, #list);                                    \
+        } else {                                                               \
+            i = 0;                                                             \
+            elem_t *current = list->head;                                      \
+            while (current != NULL) {                                          \
+                i++;                                                           \
+                if (list->compare(current->data, target)) {                    \
+                    break;                                                     \
+                }                                                              \
+                current = current->next;                                       \
+            }                                                                  \
+        }                                                                      \
+        i;                                                                     \
+    })
+
+/*
+Remove an element from the list based on the data pointer
+The compare function is used to determine if the data is equal
+The list->free function is used to free the data.
+
+If your data is a primitive type, you can just pass the data directly
+Example: list_remove(list, 5) -> Removes the element with data 5
+
+If your data is a pointer, you must pass the address of the pointer
+Example: list_remove(list, &data) -> Removes the element with data pointer
+*/
+#define list_remove(list, data)                                                \
+    ({                                                                         \
+        if (list == NULL) {                                                    \
+            fprintf(stderr, "Error: list_remove(%s, %s) -> \'%s\' is NULL\n",  \
+                    #list, #data, #list);                                      \
+        }                                                                      \
+        elem_t *current = list->head;                                          \
+        while (current != NULL) {                                              \
+            if (list->compare(current->data, data) == 0) {                     \
+                if (current->prev != NULL) {                                   \
+                    current->prev->next = current->next;                       \
+                } else {                                                       \
+                    list->head = current->next;                                \
+                }                                                              \
+                if (current->next != NULL) {                                   \
+                    current->next->prev = current->prev;                       \
+                } else {                                                       \
+                    list->tail = current->prev;                                \
+                }                                                              \
+                list->free(current->data);                                     \
+                free(current);                                                 \
+                list->size--;                                                  \
+                break;                                                         \
+            }                                                                  \
+            current = current->next;                                           \
+        }                                                                      \
+    })
+
+// Remove an element at a given index
+#define list_remove_at(list, index)                                            \
+    ({                                                                         \
+        if (list == NULL) {                                                    \
+            fprintf(stderr,                                                    \
+                    "Error: list_remove_at(%s, %d) -> \'%s\' is NULL\n",       \
+                    #list, index, #list);                                      \
+        }                                                                      \
+        if (index < 0 || index >= list->size) {                                \
+            fprintf(stderr,                                                    \
+                    "Error: list_remove_at(%s, %d) -> Index out of bounds\n",  \
+                    #list, index);                                             \
+        }                                                                      \
+        elem_t *current = list->head;                                          \
+        for (int i = 0; i < index; i++) {                                      \
+            current = current->next;                                           \
+        }                                                                      \
+        if (current->prev != NULL) {                                           \
+            current->prev->next = current->next;                               \
+        } else {                                                               \
+            list->head = current->next;                                        \
+        }                                                                      \
+        if (current->next != NULL) {                                           \
+            current->next->prev = current->prev;                               \
+        } else {                                                               \
+            list->tail = current->prev;                                        \
+        }                                                                      \
+        list->free(current->data);                                             \
+        free(current);                                                         \
+        list->size--;                                                          \
+    })
+
+// Map a function to the data in the list
+#define list_map(list, func)                                                   \
+    ({                                                                         \
+        if (list == NULL) {                                                    \
+            fprintf(stderr, "Error: list_map(%s, %s) -> \'%s\' is NULL\n",     \
+                    #list, #func, #list);                                      \
+        }                                                                      \
+        if (func == NULL) {                                                    \
+            fprintf(stderr, "Error: list_map(%s, %s) -> \'%s\' is NULL\n",     \
+                    #list, #func, #func);                                      \
+        }                                                                      \
+        elem_t *current = list->head;                                          \
+        while (current != NULL) {                                              \
+            func(current->data);                                               \
+            current = current->next;                                           \
+        }                                                                      \
+    })
+
+// Filter the list based on the function
+// Remove elements from the list that return 1 from the function
+#define list_filter(list, func)                                                \
+    ({                                                                         \
+        if (list == NULL) {                                                    \
+            fprintf(stderr, "Error: list_filter(%s, %s) -> \'%s\' is NULL\n",  \
+                    #list, #func, #list);                                      \
+        }                                                                      \
+        if (func == NULL) {                                                    \
+            fprintf(stderr, "Error: list_filter(%s, %s) -> \'%s\' is NULL\n",  \
+                    #list, #func, #func);                                      \
+        }                                                                      \
+        elem_t *current = list->head;                                          \
+        while (current != NULL) {                                              \
+            if (func(current->data)) {                                         \
+                elem *next = current->next;                                    \
+                list_remove(list, current->data);                              \
+                current = next;                                                \
+            } else {                                                           \
+                current = current->next;                                       \
+            }                                                                  \
+        }                                                                      \
+    })
+
+/* -------------------------- Tree Macros ------------------------- */
+
+/*
+ * Create a node with n children
+ * The data is a void pointer to the data
+ * The number of children is set
+ * The children are NULL and to be set when adding nodes to the tree
+ */
+#define create_node(_data)                                                    \
+    ({                                                                         \
+        node_t *node = (node_t *)malloc(sizeof(node_t));                       \
+        node->data = (_data);                                                  \
+        node->num_children = 0;                                                \
+        node->children = NULL;                                                 \
+        node->parent = NULL;                                                   \
+        node;                                                                  \
+    })
+
+/*
+ * Realloc the list of children and add a child node of the data
+ * The function returns a pointer to the data if added, NULL otherwise
+ * */
+#define _add_child(_node, _data)                                               \
+    ({                                                                         \
+        node_t *child = NULL;                                                  \
+        if (_node == NULL) {                                                   \
+            fprintf(stderr, "Error: add_child(%s, %s) -> \'%s\' is NULL\n",    \
+                    #_node, #_data, #_node);                                   \
+        } else {                                                               \
+            if (_node->children == NULL) {                                     \
+                _node->children = (node_t **)malloc(sizeof(node_t *));         \
+            } else {                                                           \
+                _node->children = (node_t **)realloc(                          \
+                    _node->children,                                           \
+                    sizeof(node_t *) * (_node->num_children + 1));             \
+            }                                                                  \
+            child = create_node(_data);                                       \
+            child->parent = _node;                                             \
+            _node->children[_node->num_children] = child;                      \
+            _node->num_children++;                                             \
+        }                                                                      \
+        child;                                                                 \
+    })
+
+/*
+ * Free a node and all of its children
+ * The node->free function is used to free the data. If the node->free function
+ * is NULL, the data is freed using the free function. This will most likely
+ * result in a memory leak if the data is not a primitive type.
+ */
+#define free_nodes(node, free_data) ({ _free_nodes(node, free_data); })
+
+// Helper function to free nodes since the a macro cannot recurse
+void _free_nodes(node_t *node, free_func free_data) {
+
+    if (node == NULL) {
+        fprintf(stderr, "Error: free_nodes(node, free_data) -> NULL");
+        return;
+    } else {
+        if (node->children != NULL) {
+            for (int i = 0; i < node->num_children; i++) {
+                _free_nodes(node->children[i], free_data);
+            }
+            free(node->children);
+        }
+        free_data(node->data);
+        free(node);
+    }
+}
+
+/*
+ * Remove a node from the tree and link its children to the parent node.
+ * The tree->free function is passed to free the data. If the tree->free
+ * function is NULL, the data is freed using the free() function. This will most
+ * likely result in a memory leak if the data is not a primitive type.
+ */
+#define _remove_node(node, free_data)                                          \
+    ({                                                                         \
+        if (node == NULL) {                                                    \
+            fprintf(stderr, "Error: remove_node(%s) -> \'%s\' is NULL\n",      \
+                    #node, #node);                                             \
+        } else {                                                               \
+            /* Link the children to the parent node */                         \
+            if (node->children != NULL) {                                      \
+                for (int i = 0; i < node->num_children; i++) {                 \
+                    node->children[i]->parent = node->parent;                  \
+                }                                                              \
+            }                                                                  \
+            if (node->parent != NULL) {                                        \
+                /* Remove the node from the parent's children */               \
+                for (int i = 0; i < node->parent->num_children; i++) {         \
+                    if (node->parent->children[i] == node) {                   \
+                        node->parent->children[i] = NULL;                      \
+                        node->num_children--;                                  \
+                    }                                                          \
+                }                                                              \
+                /* Shift the children to the left and realloc */               \
+                for (int i = 0; i < node->parent) {                            \
+                    if (node->parent->children[i] == NULL) {                   \
+                        for (int j = i; j < node->parent->num_children; j++) { \
+                            node->parent->children[j] =                        \
+                                node->parent->children[j + 1];                 \
+                        }                                                      \
+                    }                                                          \
+                }                                                              \
+                /* Increment parent's num_children and realloc children */     \
+                node->parent->num_children += node->num_children;              \
+                node->parent->children = (node_t **)realloc(                   \
+                    node->parent->children,                                    \
+                    sizeof(node_t *) * node->parent->num_children);            \
+                /* Add the children to the parent's children */                \
+                for (int i = 0; i < node->num_children; i++) {                 \
+                    int index =                                                \
+                        node->parent->num_children - node->num_children + i;   \
+                    node->parent->children[index] = node->children[i];         \
+                }                                                              \
+            }                                                                  \
+            /* Free the data using the free_data argument */                   \
+            if (free_data != NULL) {                                           \
+                free_data(node->data);                                         \
+            } else {                                                           \
+                free(node->data);                                              \
+            }                                                                  \
+            /* Free the children list and the node */                          \
+            /* Do not free the parent attribute */                             \
+            free(node->children);                                              \
+            free(node);                                                        \
+        }                                                                      \
+    })
+
+/*
+ * Initialize a tree
+ * The root is NULL and the number of children is set
+ */
+#define _tree_init(tree, _free, _compare, _to_str, _print)                     \
+    ({                                                                         \
+        if (tree == NULL) {                                                    \
+            fprintf(stderr,                                                    \
+                    "Error: tree_init(%s, %s, %s, %s, %s) -> \'%s\' "          \
+                    "is NULL\n",                                               \
+                    #tree, #_free, #_compare, #_to_str, #_print, #tree);       \
+        }                                                                      \
+        tree->root = NULL;                                                     \
+        tree->num_children = 0;                                                \
+        tree->free = (_free);                                                  \
+        tree->compare = (_compare);                                            \
+        tree->to_str = (_to_str);                                              \
+        tree->print = (_print);                                                \
+    })
+
+/*
+ * Create an empty tree
+ * The tree returns with 0 children and the root is NULL
+ */
+#define create_tree(T, free, compare, to_str, print)                           \
+    ({                                                                         \
+        T##_tree *tree = (T##_tree *)malloc(sizeof(T##_tree));                 \
+        free_func _free = (free);                                              \
+        compare_func _compare = (compare);                                     \
+        to_string_func _to_str = (to_str);                                     \
+        print_func _print = (print);                                           \
+        _tree_init(tree, _free, _compare, _to_str, _print);                    \
         tree;                                                                  \
     })
 
-// Function to add a node to the tree_t structure
-// If the tree is empty, the root will be the new node
-// Otherwise, the node will be added to the root's children
-//
-// Calls: add_child
-void _tree_t_add(tree_t *tree, node_t *node) {
-    if (node->type != TREE) {
-        printf("tree_add -> Error: Node is not a tree node\n");
+/*
+ * Add a child node to the target node of a tree. If the target node is not
+ * null, add a child to the target node. If the target node is NULL, set the
+ * tree root to the data. The data is a void pointer to the data. The function
+ * returns a pointer to the data if added, NULL otherwise.
+ *
+ * Calls: add_child(node, data)
+ */
+#define tree_add(tree, node, data)                                             \
+    ({                                                                         \
+        void *_data = NULL;                                                    \
+        node_t *_node = (node);                                                \
+        node_t *added = NULL;                                                  \
+        if (tree == NULL) {                                                    \
+            fprintf(stderr, "Error: tree_add(%s, %s, %s) -> \'%s\' is NULL\n", \
+                    #tree, #node, #data, #tree);                               \
+        } else {                                                               \
+            _data = (data);                                                    \
+            if (_node == NULL) {                                               \
+                if (tree->root == NULL) {                                      \
+                    tree->root = create_node(_data);                          \
+                } else {                                                       \
+                    added = _add_child(_node, _data);                          \
+                }                                                              \
+            } else {                                                           \
+                added = _add_child(_node, _data);                              \
+            }                                                                  \
+            tree->num_children++;                                              \
+        }                                                                      \
+        added;                                                                 \
+    })
+
+/* Return the first node found with matching data */
+#define tree_find(tree, target_data)                                           \
+    ({                                                                         \
+        int index = -1;                                                        \
+        void *_target_data = NULL;                                             \
+        if (tree == NULL) {                                                    \
+            fprintf(stderr, "Error: tree_find(%s, %s) -> \'%s\' is NULL\n",    \
+                    #tree, #target_data, #tree);                               \
+        } else {                                                               \
+            _target_data = (target_data);                                      \
+            node_t *current = tree->root;                                      \
+            index = _find_node(current, _target_data, tree->compare);          \
+        }                                                                      \
+        index;                                                                 \
+    })
+
+// Helper function to find a node with matching data
+// Returns a pointer to the node if found, NULL otherwise
+node_t *_find_node(node_t *node, void *target_data, compare_func compare) {
+    if (node == NULL) {
+        return NULL;
+    }
+    if (compare(node->data, target_data)) {
+        return node;
+    }
+    for (int i = 0; i < node->num_children; i++) {
+        node_t *found = _find_node(node->children[i], target_data, compare);
+        if (found != NULL) {
+            return found;
+        }
+    }
+    return NULL;
+}
+
+/*
+ *
+ * Insert data into the tree at the first occurrence of the target data.
+ * Iterate through all nodes in the tree and find the first node with matching
+ * data. Data is compared using the tree->compare function. If the target data
+ * is found, add the data as a child to the target node. The function returns a
+ * pointer to the data if added, NULL otherwise.
+ */
+#define tree_insert(tree, target_data, data)                                   \
+    ({                                                                         \
+        void *_data = NULL;                                                    \
+        void *_target_data = NULL;                                             \
+        node_t *target = NULL;                                                 \
+        node_t *added = NULL;                                                  \
+        if (tree == NULL) {                                                    \
+            fprintf(stderr,                                                    \
+                    "Error: tree_insert(%s, %s, %s) -> \'%s\' is NULL\n",      \
+                    #tree, #target_data, #data, #tree);                        \
+        } else {                                                               \
+            _data = (data);                                                    \
+            _target_data = (target_data);                                      \
+            node_t *target = tree_find(tree, _target_data);                    \
+            if (target != -1) {                                                \
+                added = _add_child(target, _data);                             \
+            }                                                                  \
+        }                                                                      \
+        added;                                                                 \
+    })
+
+/*
+ * Free all tree nodes and the tree itself.
+ * free_node() is used to free the nodes and their children.
+ */
+#define free_tree(tree)                                                        \
+    ({                                                                         \
+        if (tree == NULL) {                                                    \
+            fprintf(stderr, "Error: free_tree(%s) -> \'%s\' is NULL\n", #tree, \
+                    #tree);                                                    \
+        } else {                                                               \
+            if (tree->root != NULL) {                                          \
+                free_nodes(tree->root, tree->free);                            \
+            }                                                                  \
+            free(tree);                                                        \
+        }                                                                      \
+    })
+
+/*
+ * Print the tree
+ */
+#define print_tree(tree)                                                       \
+    ({                                                                         \
+        if (tree == NULL) {                                                    \
+            fprintf(stderr, "Error: print_tree(%s) -> \'%s\' is NULL\n",       \
+                    #tree, #tree);                                             \
+        } else {                                                               \
+            fprintf(stdout, "Tree: %s\n", #tree);                              \
+            if (tree->root != NULL) {                                          \
+                _print_tree(tree, tree->root, 0, tree->print);                 \
+            }                                                                  \
+        }                                                                      \
+    })
+
+// Helper function to print the tree
+void _print_tree(tree_t *tree, node_t *node, int depth, print_func print) {
+    if (node == NULL) {
         return;
     }
-    if (tree->root == NULL) {
-        tree->root = node;
-    } else {
-        add_child(tree->root, node);
+    for (int i = 0; i < depth; i++) {
+        fprintf(stdout, "  ");
     }
-    tree->size++;
+    tree->print(node->data);
+    fprintf(stdout, "\n");
+    for (int i = 0; i < node->num_children; i++) {
+        _print_tree(tree, node->children[i], depth + 1, print);
+    }
 }
 
-// Function to remove a node from the tree_t structure
-// Calls: remove_node
-void _tree_t_remove(tree_t *tree, node_t *node) {
-    if (node->type != TREE) {
-        printf("tree_remove -> Error: Node is not a tree node\n");
+/* -------------------------- Int Elem Functions ------------------------ */
+
+// Create an int pointer
+void *create_int(int i) {
+    int *i_ptr = (int *)malloc(sizeof(int));
+    *i_ptr = i;
+    return (void *)i_ptr;
+}
+
+// Compare int pointer data
+int compare_int(void *a, void *b) {
+    if (a == NULL && b == NULL) {
+        return 0;
+    } else if (a == NULL) {
+        return 0;
+    } else if (b == NULL) {
+        return 0;
+    }
+
+    int *ia = (int *)a;
+    int *ib = (int *)b;
+    return ((*ia - *ib) == 0);
+}
+
+// Print int pointer data
+void print_int(void *ptr) {
+    if (ptr == NULL)
         return;
-    }
-    remove_node(tree->root, node);
-    tree->size--;
+    fprintf(stdout, "%d", *(int *)ptr);
 }
 
-// Remove child from root at index
-void _tree_t_remove_at(tree_t *tree, int index) {
+// Free int pointer data
+// Not needed since the data is a primitive type and can be passed with &...
+void free_int(void *ptr) { return; }
 
-    if (index < 0 || index >= tree->root->num_children) {
-        printf("Error: Index out of bounds\n");
+// Convert int pointer data to string
+// Must free the returned string
+const char *int_to_str(void *i) {
+    char *str = (char *)malloc(12);
+    sprintf(str, "%d", *(int *)i);
+    return str;
+}
+
+/* -------------------------- Float Elem Functions ------------------------- */
+
+// Create a float pointer
+void *create_float(float f) {
+    float *f_ptr = (float *)malloc(sizeof(float));
+    *f_ptr = f;
+    return (void *)f_ptr;
+}
+
+// Compare float pointer data
+// Return 1 if equal, 0 if not equal
+int compare_float(void *a, void *b) {
+    if (a == NULL && b == NULL) {
+        return 0;
+    } else if (a == NULL) {
+        return 0;
+    } else if (b == NULL) {
+        return 0;
+    }
+
+    float *fa = (float *)a;
+    float *fb = (float *)b;
+    return ((*fa - *fb) == 0);
+}
+
+// Print float pointer data
+void print_float(void *ptr) {
+    if (ptr == NULL)
         return;
-    }
-
-    node_t *current = tree->root->next[index];
-    remove_node(tree->root, current);
-    tree->size--;
+    fprintf(stdout, "%f", *(float *)ptr);
 }
 
-// Function to free a tree_t structure, all logic is handled in free_node
-// Calls: free_node
-void _tree_t_free(tree_t *tree) {
-    free_node(tree->root);
-    free(tree);
+// Free float pointer data
+void free_float(void *ptr) {
+    if (ptr == NULL)
+        return;
+    free(ptr);
 }
 
-// Function to map a function to each node in the tree_t structure
-// Calls: map_node
-void _tree_t_map(tree_t *tree, void (*func)(node_t *)) {
-    map_node(tree->root, func);
+// Convert float pointer data to to_string
+// Must free the returned string
+const char *float_to_str(float *f) {
+    char *str = (char *)malloc(12);
+    sprintf(str, "%f", *f);
+    return str;
 }
 
-/* ---------------------------- Definitions -------------------------------- */
-
-// If you are using your own data structure you can implement functions with the
-// following macros. This will allow you to use the same functions as list_t.
-#define DEFINE_STRUCTURE_FUNCTIONS(TYPE)                                       \
-    void TYPE##_add(TYPE *t, node_t *node) { _##TYPE##_add(t, node); }         \
-    void TYPE##_free(TYPE *t) { _##TYPE##_free(t); }                           \
-    void TYPE##_remove(TYPE *t, node_t *node) { _##TYPE##_remove(t, node); }   \
-    void TYPE##_remove_at(TYPE *t, int index) {                                \
-        _##TYPE##_remove_at(t, index);                                         \
-    }                                                                          \
-    void TYPE##_map(TYPE *t, void (*func)(node_t *)) {                         \
-        _##TYPE##_map(t, func);                                                \
-    };
+/* -------------------------- Char Elem Functions ------------------------- */

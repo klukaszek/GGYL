@@ -1,11 +1,11 @@
 all: ggyl test
 
-ggyl: ggyl.c
-	gcc -Wall -g -o ggyl ggyl.c
+ggyl: ggyl.c ggyl.h
+	gcc -Wall -g -std=gnu11 -o ggyl ggyl.c ggyl.h
 
 
-test: test2.c test3.h
-	gcc -Wall -g -std=gnu11 -o test test2.c test3.h
+test: test.c ggyl.h
+	gcc -Wall -g -std=gnu11 -o test test.c ggyl.h
 
 .PHONY: clean
 clean:
