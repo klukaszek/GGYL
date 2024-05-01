@@ -1,8 +1,8 @@
-# Gargoyle
+# ggyl (Gargoyle)
 
 ## Simple Directory Watching
 
-I came across the problem of wanting a C build system that I could use to hot-reload a WASM compiled binary in my browser. At the very same moment, I was also looking for a solution that would let me hot-reload *rendered* markdown in my terminal.
+I came across the problem of wanting a C build system that I could use to hot-reload a WASM compiled binary in my browser. At the very same moment, I was also looking for a solution that would let me hot-reload *rendered* markdown in my terminal using Glow.
 
 To solve this problem I decided to create Gargoyle, my simple directory watching and CLI automation solution.
 
