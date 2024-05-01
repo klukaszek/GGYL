@@ -8,11 +8,18 @@ monitor_t monitor = {-1,
                      NULL,
                      0,
                      NULL,
-                     IN_CREATE | IN_DELETE | IN_ISDIR | IN_MOVED_FROM};
+                     IN_MODIFY | IN_CREATE | IN_DELETE | IN_ISDIR |
+                         IN_MOVED_FROM};
 
 // Print usage and exit
 void usage() {
-    fprintf(stderr, "Usage: ggyl [-d directory] cmd [regex_patterns...]\n");
+    fprintf(stderr, "Usage: ggyl [-d directory] cmd [regex_patterns]\n");
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  -d directory  Directory to monitor\n");
+    fprintf(stderr, "  cmd           Command to execute\n");
+    fprintf(
+        stderr,
+        "  regex_patterns  \"*.c\" \"*.md\" (optional. max 128 patterns)\n");
     exit(EXIT_FAILURE);
 }
 
@@ -132,13 +139,35 @@ int_tree *build_watch_tree(monitor_t *mon, char *dir, node_t *parent) {
         exit(EXIT_FAILURE);
     }
 
+    // Block signals during the creation of the node to avoid leaking memory on
+    // close
+    sigset_t set, oldset;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+    sigaddset(&set, SIGSEGV);
+    sigprocmask(SIG_BLOCK, &set, &oldset);
+
+    // Create a new node and figure out if it's the root node or not
     node_t *node = create_node(NULL);
     if (wd_entries->root == NULL) {
-        printf("Adding root watcher to %s\n", dir);
         wd_entries->root = node;
     } else {
         _add_child(parent, node);
     }
+
+    // Add the watch descriptor to the directory
+    int wd = inotify_add_watch(mon->fd, dir, mon->mask);
+    if (wd < 0) {
+        perror("inotify_add_watch");
+        exit(EXIT_FAILURE);
+    }
+
+    // Add the watch descriptor to the node
+    node->data = &wd;
+
+    // Unblock signals by restoring the old signal mask
+    sigprocmask(SIG_SETMASK, &oldset, NULL);
 
     // Read the directory entries
     struct dirent *entry;
@@ -148,7 +177,6 @@ int_tree *build_watch_tree(monitor_t *mon, char *dir, node_t *parent) {
             if (entry->d_name[0] == '.') {
                 continue;
             }
-            printf("Adding watcher to %s\n", entry->d_name);
 
             // Build the full path
             char path[MAX_LEN];
@@ -160,16 +188,6 @@ int_tree *build_watch_tree(monitor_t *mon, char *dir, node_t *parent) {
 
     // Close the directory
     closedir(dp);
-
-    // Add the watch descriptor to the directory
-    int wd = inotify_add_watch(mon->fd, dir, mon->mask);
-    if (wd < 0) {
-        perror("inotify_add_watch");
-        exit(EXIT_FAILURE);
-    }
-
-    // Add the watch descriptor to the node
-    node->data = &wd;
 
     return wd_entries;
 }
@@ -214,8 +232,9 @@ void monitor_directory(monitor_t *mon) {
                 FD_ZERO(&fds);
                 FD_SET(mon->fd, &fds);
                 tv.tv_sec = 0;
-                tv.tv_usec = 2000000;
+                tv.tv_usec = 20000;
 
+                // Wait for inotify events on the file descriptor
                 ret = select(mon->fd + 1, &fds, NULL, NULL, &tv);
                 if (ret < 0) {
                     fprintf(stderr, "Failed to select inotify event: %s",
@@ -223,32 +242,36 @@ void monitor_directory(monitor_t *mon) {
                     break;
                 }
 
+                // Read file descriptor to buffer
                 read(mon->fd, buffer, buffer_size);
 
+                // get an inotify event from the buffer
                 struct inotify_event *event = (struct inotify_event *)buffer;
-                if (event->len &&
-                    (event->mask & IN_CREATE || event->mask & IN_DELETE ||
-                     event->mask & IN_MODIFY)) {
+                if (event->len) {
 
                     // Rebuid the watch tree if a directory change is noted
                     if (event->mask & IN_ISDIR &&
                         (event->mask & IN_CREATE || event->mask & IN_DELETE ||
                          event->mask & IN_MOVE)) {
-                        printf("Directory action\n"); 
                         free_tree(mon->wd_entries);
                         mon->wd_entries = create_tree(
                             int, free_int, compare_int, int_to_str, print_int);
                         mon->wd_entries = build_watch_tree(mon, mon->dir, NULL);
-                    }
-
-                    // Execute the command if any of the regex patterns match
-                    if (check_patterns(mon, event->name)) {
+                        system("clear");
                         system(mon->cmd);
-                        sleep(0);
                         break;
                     }
+
+                    // If the event is a modify event, check if the event name
+                    // matches any of the regex patterns
+                    if (event->mask & IN_MODIFY) {
+                        if (check_patterns(mon, event->name)) {
+                            system("clear");
+                            system(mon->cmd);
+                            break;
+                        }
+                    }
                 }
-                break;
             }
         }
     }
@@ -256,7 +279,7 @@ void monitor_directory(monitor_t *mon) {
 
 // Free memory and exit
 void handle_signal(int sig) {
-    printf("\nCaught signal %d -> SIG%s\n", sig, sys_siglist[sig]);
+    printf("\nggyl: Caught signal %d -> SIG%s\n", sig, sys_siglist[sig]);
     free_regex_entries(&monitor);
     free_tree(monitor.wd_entries);
     close(monitor.fd);
